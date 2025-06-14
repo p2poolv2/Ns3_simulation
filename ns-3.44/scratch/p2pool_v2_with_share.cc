@@ -17,6 +17,9 @@
 #include <cmath> 
 #include <chrono>
 #include <algorithm>
+#include <random>   // for random_device, mt19937
+// #include <algorithm> // for std::shuffle
+
 
 using namespace ns3;
 
@@ -420,31 +423,8 @@ class TcpGossipApp : public Application {
             // Set up receive callback
             socket->SetRecvCallback(MakeCallback(&TcpGossipApp::ReceiveMessage, this));
         }
-    
-        void SendMessage(std::string msg) {
-            if (m_messageManager.IsReceived(msg)) return;
-    
-            m_messageManager.MarkReceived(msg);
-            AddToPendingMessages(msg);
-        }
 
-        // Enhanced method for sending blockchain messages (blocks)
-        void SendBlockMessage(const std::string& serializedBlock) {
-            // Parse the block to get its hash for duplicate checking
-            std::string blockHash = ExtractBlockHash(serializedBlock);
-            
-            if (!blockHash.empty() && m_messageManager.IsBlockReceived(blockHash)) {
-                return; // Already processed this block
-            }
-            
-            // Mark as received and forward
-            if (!blockHash.empty()) {
-                m_messageManager.MarkBlockReceived(blockHash);
-            }
-            m_messageManager.MarkReceived(serializedBlock);
-            AddToPendingMessages(serializedBlock);
-        }
-    
+        
         void ReceiveMessage(Ptr<Socket> socket) {
             Address from;
             socket->GetPeerName(from);
@@ -482,7 +462,7 @@ class TcpGossipApp : public Application {
                 // Update based on the socket directly
                 m_connectionPool.UpdateActivityFromSocket(socket);
             }
-        
+            
             // Process the packet
             uint32_t size = packet->GetSize();
             std::vector<uint8_t> buffer(size);  
@@ -494,6 +474,7 @@ class TcpGossipApp : public Application {
             std::string line;
             
             // Parse each line as a separate message
+
             while (std::getline(stream, line)) {
                 // Remove any carriage returns that might be present
                 if (!line.empty() && line.back() == '\r') {
@@ -537,65 +518,59 @@ class TcpGossipApp : public Application {
             
             return "";
         }
-        
-        void AddToPendingMessages(const std::string& msg) {
-            m_pendingMessages.push_back(msg);
+
+        // Enhanced method for sending blockchain messages (blocks)
+        void SendBlockMessage(const std::string& serializedBlock) {
+            // Parse the block to get its hash for duplicate checking
+            std::string blockHash = ExtractBlockHash(serializedBlock);
             
-            // If this is the first pending message, schedule forwarding
-            if (m_pendingMessages.size() == 1 && !m_forwardEvent.IsRunning()) {
-                // Schedule with random delay to prevent network congestion
-                Time delay = MilliSeconds(20 + (rand() % 200));
-                m_forwardEvent = Simulator::Schedule(delay, &TcpGossipApp::ForwardPendingMessages, this);
+            if (!blockHash.empty() && m_messageManager.IsBlockReceived(blockHash)) {
+                return; // Already processed this block
             }
-            // If we've reached the batch size, forward immediately
-            else if (m_pendingMessages.size() >= MAX_PENDING_MESSAGES && !m_forwardEvent.IsRunning()) {
-                m_forwardEvent = Simulator::Schedule(FORWARD_INTERVAL, &TcpGossipApp::ForwardPendingMessages, this);
+            
+            // Mark as received (use block-specific tracking)
+            if (!blockHash.empty()) {
+                m_messageManager.MarkBlockReceived(blockHash);
             }
+            
+            // Send immediately
+            SendMessage(serializedBlock);
         }
-        
-        void ForwardPendingMessages() {
-            if (m_pendingMessages.empty()) return;
-            
-            // Process all pending messages
-            for (const auto& msg : m_pendingMessages) {
-                if (!m_messageManager.IsForwarded(msg)) {
-                    ForwardMessage(msg);
-                    m_messageManager.MarkForwarded(msg);
-                }
+
+        // Simplified immediate message sending
+        void SendMessage(const std::string& msg) {
+            // Check if already forwarded to prevent loops
+            if (m_messageManager.IsForwarded(msg)) {
+                return;
             }
             
-            // Clear pending messages
-            m_pendingMessages.clear();
+            // Mark as received and forwarded
+            m_messageManager.MarkReceived(msg);
+            m_messageManager.MarkForwarded(msg);
+            
+            // Forward immediately to network
+            ForwardMessage(msg);
         }
-        
+
         void ForwardMessage(const std::string& msg) {
             // Add newline character to delimit messages
             std::string msgWithDelimiter = msg + "\n";
-    
-            // Get active neighbors in priority order
-            std::vector<Ipv6Address> priorityNeighbors;
+
+            // Get all active neighbors
+            std::vector<Ipv6Address> activeNeighbors;
             for (const auto& neighbor : m_neighbors) {
                 if (m_connectionPool.IsActive(neighbor)) {
-                    priorityNeighbors.push_back(neighbor);
+                    activeNeighbors.push_back(neighbor);
                 }
             }
             
-            // Random shuffle to distribute load
-            std::random_shuffle(priorityNeighbors.begin(), priorityNeighbors.end());
-            
-            // Forward to a subset of neighbors to reduce network load
-            // For blockchain messages, be more aggressive in forwarding
-            uint32_t forwardCount;
-            if (IsBlockchainMessage(msg)) {
-                // Forward blocks to more neighbors for better propagation
-                forwardCount = std::max(5u, (uint32_t)(priorityNeighbors.size() * 0.7));
-            } else {
-                // Regular messages use conservative forwarding
-                forwardCount = std::max(3u, (uint32_t)(priorityNeighbors.size() * 0.5));
+            if (activeNeighbors.empty()) {
+                // No active neighbors to forward to
+                return;
             }
             
-            for (uint32_t i = 0; i < std::min(forwardCount, (uint32_t)priorityNeighbors.size()); i++) {
-                Ipv6Address neighbor = priorityNeighbors[i];
+            // Send to ALL active neighbors
+            for (const auto& neighbor : activeNeighbors) {
                 Ptr<Socket> socket = m_connectionPool.GetSocket(neighbor);
                 
                 if (socket) {
@@ -603,6 +578,7 @@ class TcpGossipApp : public Application {
                     int bytes = socket->Send(packet);
                     
                     if (bytes <= 0) {
+                        // Mark socket as inactive if send failed
                         m_connectionPool.SetSocketActive(neighbor, false);
                     }
                 }
@@ -748,6 +724,104 @@ private:
     std::string m_currentHead;
     std::map<uint32_t, std::vector<std::string>> m_blocksByHeight;  // Height -> list of block hashes
     uint32_t m_currentHeight;
+
+
+
+    void printMainChain(uint32_t nodeId) const {
+        NS_LOG_INFO("--- MAIN CHAIN (Genesis to Head) ---");
+        
+        // Build main chain path
+        std::vector<std::string> mainChain;
+        std::string current = m_currentHead;
+        
+        while (current != "genesis" && !current.empty()) {
+            mainChain.push_back(current);
+            auto blockIt = m_blockchain.find(current);
+            if (blockIt == m_blockchain.end()) break;
+            current = blockIt->second->parentHash;
+        }
+        mainChain.push_back("genesis");
+        
+        std::reverse(mainChain.begin(), mainChain.end());
+        
+        // Print each block in the main chain
+        for (size_t i = 0; i < mainChain.size(); ++i) {
+            const auto& hash = mainChain[i];
+            auto block = m_blockchain.at(hash);
+            
+            std::string arrow = (i == mainChain.size() - 1) ? " [HEAD]" : " -> ";
+            
+            NS_LOG_INFO("  " << i << ": " << hash 
+                       << " (Height: " << block->blockNumber 
+                       << ", Miner: " << block->nodeId
+                       << ", Weight: " << block->chainWeight
+                       << ", Time: " << std::fixed << std::setprecision(2) << block->timestamp
+                       << ")" << arrow);
+        }
+    }
+    
+    void printSideChains(uint32_t nodeId) const {
+        NS_LOG_INFO("--- SIDE CHAINS & UNCLE BLOCKS ---");
+        
+        std::map<uint32_t, std::vector<std::shared_ptr<Share>>> blocksByHeight;
+        
+        // Group all blocks by height
+        for (const auto& pair : m_blockchain) {
+            if (pair.first != "genesis") {
+                blocksByHeight[pair.second->blockNumber].push_back(pair.second);
+            }
+        }
+        
+        // Print side blocks at each height
+        for (const auto& heightPair : blocksByHeight) {
+            uint32_t height = heightPair.first;
+            const auto& blocks = heightPair.second;
+            
+            if (blocks.size() > 1) { // More than one block at this height
+                NS_LOG_INFO("  Height " << height << " has " << blocks.size() << " blocks:");
+                
+                for (const auto& block : blocks) {
+                    bool isMainChain = isOnMainChain(block->blockHash);
+                    std::string status = isMainChain ? "[MAIN]" : "[SIDE]";
+                    
+                    NS_LOG_INFO("    " << status << " " << block->blockHash
+                               << " (Miner: " << block->nodeId
+                               << ", Weight: " << block->chainWeight
+                               << ", Time: " << std::fixed << std::setprecision(2) << block->timestamp << ")");
+                }
+            }
+        }
+    }
+    
+    void printOrphanBlocks(uint32_t nodeId) const {
+        NS_LOG_INFO("--- ORPHAN BLOCKS ---");
+        
+        std::vector<std::shared_ptr<Share>> orphans;
+        
+        for (const auto& pair : m_blockchain) {
+            if (pair.first != "genesis") {
+                const auto& block = pair.second;
+                // Check if parent exists
+                if (m_blockchain.find(block->parentHash) == m_blockchain.end() && 
+                    block->parentHash != "genesis") {
+                    orphans.push_back(block);
+                }
+            }
+        }
+        
+        if (orphans.empty()) {
+            NS_LOG_INFO("  No orphan blocks found.");
+        } else {
+            for (const auto& orphan : orphans) {
+                NS_LOG_INFO("  ORPHAN: " << orphan->blockHash
+                           << " (Height: " << orphan->blockNumber
+                           << ", Miner: " << orphan->nodeId
+                           << ", Parent: " << orphan->parentHash
+                           << ", Time: " << std::fixed << std::setprecision(2) << orphan->timestamp << ")");
+            }
+        }
+    }
+
     
 public:
     BlockchainState() : m_currentHead("genesis"), m_currentHeight(0) {
@@ -880,7 +954,7 @@ public:
     }
     
     // Check if block is on main chain
-    bool isOnMainChain(const std::string& blockHash) {
+    bool isOnMainChain(const std::string& blockHash) const  {
         std::string current = m_currentHead;
         while (current != "genesis" && !current.empty()) {
             if (current == blockHash) {
@@ -929,6 +1003,58 @@ public:
             NS_LOG_INFO("  " << hash << " (height: " << block->blockNumber 
                        << ", weight: " << block->chainWeight << ")");
         }
+    }
+
+
+        // Enhanced method to print complete blockchain state with more detail
+    void printCompleteState(uint32_t nodeId) const {
+        NS_LOG_INFO("=== COMPLETE BLOCKCHAIN STATE FOR NODE " << nodeId << " ===");
+        NS_LOG_INFO("Current Head: " << m_currentHead);
+        NS_LOG_INFO("Current Height: " << m_currentHeight);
+        NS_LOG_INFO("Total Blocks: " << m_blockchain.size());
+        
+        // Print main chain from genesis to head
+        printMainChain(nodeId);
+        
+        // Print uncle/side blocks
+        printSideChains(nodeId);
+        
+        // Print orphan blocks
+        printOrphanBlocks(nodeId);
+        
+        NS_LOG_INFO("=== END BLOCKCHAIN STATE FOR NODE " << nodeId << " ===\n");
+    }
+
+    // Method to get blockchain statistics
+    std::map<std::string, uint32_t> getBlockchainStats() const {
+        std::map<std::string, uint32_t> stats;
+        
+        stats["total_blocks"] = m_blockchain.size();
+        stats["main_chain_length"] = m_currentHeight + 1; // +1 for genesis
+        stats["side_blocks"] = m_blockchain.size() - (m_currentHeight + 1);
+        
+        // Count blocks by miner
+        std::map<uint32_t, uint32_t> minerCounts;
+        for (const auto& pair : m_blockchain) {
+            if (pair.first != "genesis") {
+                minerCounts[pair.second->nodeId]++;
+            }
+        }
+        
+        stats["unique_miners"] = minerCounts.size();
+        
+        return stats;
+    }
+    
+    // Get all blocks as a vector for analysis
+    std::vector<std::shared_ptr<Share>> getAllBlocks() const {
+        std::vector<std::shared_ptr<Share>> allBlocks;
+        for (const auto& pair : m_blockchain) {
+            if (pair.first != "genesis") {
+                allBlocks.push_back(pair.second);
+            }
+        }
+        return allBlocks;
     }
 };
 
@@ -984,8 +1110,26 @@ class MinerApp : public Application {
             }
             
             // Print final blockchain state
-            NS_LOG_INFO("Final blockchain state for node " << GetNode()->GetId() << ":");
-            m_blockchain->printState();
+            // NS_LOG_INFO("Final blockchain state for node " << GetNode()->GetId() << ":");
+            // m_blockchain->printState();
+        }
+
+            // Method to get blockchain state for analysis
+        const BlockchainState* GetBlockchainState() const {
+            return m_blockchain.get();
+        }
+        
+        // Get detailed node statistics
+        std::map<std::string, double> getNodeStats() const {
+            std::map<std::string, double> stats;
+            stats["blocks_mined"] = static_cast<double>(m_blockCounter);
+            
+            auto blockchainStats = m_blockchain->getBlockchainStats();
+            stats["total_blocks_seen"] = static_cast<double>(blockchainStats["total_blocks"]);
+            stats["main_chain_length"] = static_cast<double>(blockchainStats["main_chain_length"]);
+            stats["side_blocks_seen"] = static_cast<double>(blockchainStats["side_blocks"]);
+            
+            return stats;
         }
         
         void SetSimulationStopTime(double stopTime) {
@@ -1093,7 +1237,7 @@ class MinerApp : public Application {
                 NS_LOG_INFO("Node " << GetNode()->GetId() << " mined block " << blockHash 
                            << " (height: " << newHeight << ") at time " << currentTime);
                 
-                // Propagate the block to other nodes using the enhanced method
+                // Propagate the block to other nodes
                 if (m_gossipApp) {
                     std::string serializedBlock = newBlock->serialize();
                     m_gossipApp->SendBlockMessage(serializedBlock);
@@ -1153,41 +1297,40 @@ class MinerApp : public Application {
     // Initialize static members
     uint32_t MinerApp::totalBlocksMined = 0;
     std::map<uint32_t, uint32_t> MinerApp::perNodeMinedBlocks;
-    double MinerApp::s_minMiningInterval = 10.0;
+    double MinerApp::s_minMiningInterval = 0.0;
     double MinerApp::s_maxMiningInterval = 30.0;
 
 
 void TcpGossipApp::ProcessReceivedMessage(const std::string& message) {
-            // Check if this is a blockchain message (contains pipe separators)
-            if (IsBlockchainMessage(message)) {
-                // Extract block hash for duplicate checking
-                std::string blockHash = ExtractBlockHash(message);
-                
-                if (!blockHash.empty()) {
-                    // Check if we've already processed this block
-                    if (m_messageManager.IsBlockReceived(blockHash)) {
-                        return; // Already processed
-                    }
-                    
-                    // Mark as received
-                    m_messageManager.MarkBlockReceived(blockHash);
-                    
-                    // Forward to miner app for processing
-                    if (m_minerApp) {
-                        // m_minerApp->OnBlockReceived(message);
-                        
-                    }
-                }
+    // Since you're only handling blockchain messages, check if this is one
+    if (IsBlockchainMessage(message)) {
+        // Extract block hash for duplicate checking
+        std::string blockHash = ExtractBlockHash(message);
+        
+        if (!blockHash.empty()) {
+            // Check if we've already processed this block
+            if (m_messageManager.IsBlockReceived(blockHash)) {
+                return; // Already processed
             }
             
-            // Process the message if not received before
-            if (!m_messageManager.IsReceived(message)) {
-                m_messageManager.MarkReceived(message);
-                
-                // Add to pending messages for forwarding
-                AddToPendingMessages(message);
+            // Mark as received
+            m_messageManager.MarkBlockReceived(blockHash);
+            
+            // Forward to miner app for processing
+            if (m_minerApp) {
+                m_minerApp->OnBlockReceived(message);
+            }
+            
+            // Forward immediately to all neighbors - check if already forwarded to prevent loops
+            if (!m_messageManager.IsForwarded(message)) {
+                // Mark as forwarded and send immediately
+                m_messageManager.MarkForwarded(message);
+                ForwardMessage(message);
             }
         }
+    }
+    // If it's not a blockchain message, ignore it since you only handle blocks
+}
 
 void CreateSmallWorldNetworkP2P(NodeContainer& nodes,
                                PointToPointHelper& pointToPoint,
@@ -1516,12 +1659,180 @@ class NetworkMonitor {
     };
 
 
+    void PrintBlockchainStatesForNodes(const std::vector<Ptr<Node>>& nodes, 
+                                    const std::vector<uint32_t>& nodeIds) {
+        NS_LOG_INFO("\n");
+        NS_LOG_INFO("################################################################################");
+        NS_LOG_INFO("                    FINAL BLOCKCHAIN STATES COMPARISON");
+        NS_LOG_INFO("################################################################################");
+        
+        // Print individual blockchain states
+        for (uint32_t nodeId : nodeIds) {
+            if (nodeId < nodes.size()) {
+                Ptr<Node> node = nodes[nodeId];
+                
+                // Get the MinerApp from the node
+                Ptr<Application> app = node->GetApplication(1); // Assuming MinerApp is first
+                Ptr<MinerApp> minerApp = DynamicCast<MinerApp>(app);
+                
+                if (minerApp) {
+                    const BlockchainState* blockchain = minerApp->GetBlockchainState();
+                    blockchain->printCompleteState(nodeId);
+                    
+                    // Print node statistics
+                    auto stats = minerApp->getNodeStats();
+                    NS_LOG_INFO("Node " << nodeId << " Statistics:");
+                    NS_LOG_INFO("  Blocks Mined: " << stats["blocks_mined"]);
+                    NS_LOG_INFO("  Total Blocks Seen: " << stats["total_blocks_seen"]);
+                    NS_LOG_INFO("  Main Chain Length: " << stats["main_chain_length"]);
+                    NS_LOG_INFO("  Side Blocks Seen: " << stats["side_blocks_seen"]);
+                    NS_LOG_INFO("");
+                }
+            }
+        }
+        
+        // Print comparison summary
+        NS_LOG_INFO("################################################################################");
+        NS_LOG_INFO("                         BLOCKCHAIN COMPARISON SUMMARY");
+        NS_LOG_INFO("################################################################################");
+        
+        std::map<std::string, uint32_t> headCounts;
+        std::map<uint32_t, uint32_t> chainLengths;
+        
+        for (uint32_t nodeId : nodeIds) {
+            if (nodeId < nodes.size()) {
+                Ptr<Node> node = nodes[nodeId];
+                Ptr<Application> app = node->GetApplication(1);
+                Ptr<MinerApp> minerApp = DynamicCast<MinerApp>(app);
+                
+                if (minerApp) {
+                    const BlockchainState* blockchain = minerApp->GetBlockchainState();
+                    std::string head = blockchain->getCurrentHead();
+                    uint32_t height = blockchain->getCurrentHeight();
+                    
+                    headCounts[head]++;
+                    chainLengths[height]++;
+                    
+                    NS_LOG_INFO("Node " << nodeId << " - Head: " << head << ", Height: " << height);
+                }
+            }
+        }
+        
+        NS_LOG_INFO("\nConsensus Analysis:");
+        NS_LOG_INFO("Different chain heads: " << headCounts.size());
+        for (const auto& pair : headCounts) {
+            NS_LOG_INFO("  Head " << pair.first << ": " << pair.second << " nodes");
+        }
+        
+        NS_LOG_INFO("\nChain length distribution:");
+        for (const auto& pair : chainLengths) {
+            NS_LOG_INFO("  Height " << pair.first << ": " << pair.second << " nodes");
+        }
+        
+        NS_LOG_INFO("################################################################################\n");
+    }
+
+    // Function to select random nodes for analysis
+    std::vector<uint32_t> SelectRandomNodes(uint32_t totalNodes, uint32_t numToSelect) {
+        std::vector<uint32_t> allNodes;
+        for (uint32_t i = 0; i < totalNodes; ++i) {
+            allNodes.push_back(i);
+        }
+        
+        // Shuffle and select
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        std::shuffle(allNodes.begin(), allNodes.end(), gen);
+        
+        std::vector<uint32_t> selected;
+        for (uint32_t i = 0; i < std::min(numToSelect, totalNodes); ++i) {
+            selected.push_back(allNodes[i]);
+        }
+        
+        // Sort for easier reading
+        std::sort(selected.begin(), selected.end());
+        
+        return selected;
+    }
+
+
+
+    
+    // Additional function to analyze network consensus
+    void AnalyzeNetworkConsensus(const std::vector<Ptr<Node>>& nodes, uint32_t numNodes) {
+        NS_LOG_INFO("################################################################################");
+        NS_LOG_INFO("                         NETWORK CONSENSUS ANALYSIS");
+        NS_LOG_INFO("################################################################################");
+        
+        std::map<std::string, std::vector<uint32_t>> consensusGroups;
+        std::map<uint32_t, std::vector<uint32_t>> heightGroups;
+        
+        // Group nodes by their chain head and height
+        for (uint32_t i = 0; i < numNodes; ++i) {
+            Ptr<Node> node = nodes[i];
+            Ptr<Application> app = node->GetApplication(0);
+            Ptr<MinerApp> minerApp = DynamicCast<MinerApp>(app);
+            
+            if (minerApp) {
+                const BlockchainState* blockchain = minerApp->GetBlockchainState();
+                std::string head = blockchain->getCurrentHead();
+                uint32_t height = blockchain->getCurrentHeight();
+                
+                consensusGroups[head].push_back(i);
+                heightGroups[height].push_back(i);
+            }
+        }
+        
+        // Analyze consensus
+        NS_LOG_INFO("Consensus Analysis:");
+        NS_LOG_INFO("Number of different chain heads: " << consensusGroups.size());
+        
+        if (consensusGroups.size() == 1) {
+            NS_LOG_INFO("✓ PERFECT CONSENSUS: All nodes agree on the same chain head!");
+        } else {
+            NS_LOG_INFO("⚠ FORK DETECTED: Network has split into " << consensusGroups.size() << " groups:");
+            
+            for (const auto& group : consensusGroups) {
+                NS_LOG_INFO("  Chain head " << group.first << ": " 
+                        << group.second.size() << " nodes (" 
+                        << (100.0 * group.second.size() / numNodes) << "%)");
+                
+                // Show first few nodes in each group
+                NS_LOG_INFO("    Nodes: ");
+                for (size_t i = 0; i < std::min(size_t(10), group.second.size()); ++i) {
+                    NS_LOG_INFO("      " << group.second[i]);
+                }
+                if (group.second.size() > 10) {
+                    NS_LOG_INFO("      ... and " << (group.second.size() - 10) << " more");
+                }
+            }
+        }
+        
+        // Analyze chain heights
+        NS_LOG_INFO("\nChain Height Analysis:");
+        NS_LOG_INFO("Number of different chain heights: " << heightGroups.size());
+        
+        for (const auto& group : heightGroups) {
+            NS_LOG_INFO("  Height " << group.first << ": " 
+                    << group.second.size() << " nodes (" 
+                    << (100.0 * group.second.size() / numNodes) << "%)");
+        }
+        
+        // Find the longest chain
+        auto longestChain = std::max_element(heightGroups.begin(), heightGroups.end());
+        NS_LOG_INFO("\nLongest chain has height: " << longestChain->first);
+        NS_LOG_INFO("Nodes on longest chain: " << longestChain->second.size() 
+                << " (" << (100.0 * longestChain->second.size() / numNodes) << "%)");
+        
+        NS_LOG_INFO("################################################################################");
+    }
+
 int main(int argc, char* argv[]) {
    
     // Seed the random number generator with current time
     srand(time(nullptr));
     CommandLine cmd;
-    uint32_t numNodes = 201;
+    uint32_t numNodes = 101;
     uint32_t numPeers = 8;  // Changed to 8 connections per node
     double rewireProbability = 0.5;
     double simulationTime = 500.0;
@@ -1687,8 +1998,57 @@ int main(int argc, char* argv[]) {
     std::cout << "  Min active connections: " << minConnections << std::endl;
     std::cout << "  Max active connections: " << maxConnections << std::endl;
     
+
+
+NS_LOG_INFO("\n\n");
+    NS_LOG_INFO("################################################################################");
+    NS_LOG_INFO("                           SIMULATION COMPLETED");
+    NS_LOG_INFO("################################################################################");
+    
+    // Print overall mining statistics
+    NS_LOG_INFO("Total blocks mined across all nodes: " << MinerApp::totalBlocksMined);
+    NS_LOG_INFO("Blocks per node:");
+    for (const auto& pair : MinerApp::perNodeMinedBlocks) {
+        NS_LOG_INFO("  Node " << pair.first << ": " << pair.second << " blocks");
+    }
+    
+    // Select 10 random nodes for detailed analysis
+    std::vector<uint32_t> selectedNodes = SelectRandomNodes(numNodes, 10);
+    
+    NS_LOG_INFO("\nSelected nodes for detailed blockchain analysis: ");
+    for (uint32_t nodeId : selectedNodes) {
+        NS_LOG_INFO("  Node " << nodeId);
+    }
+    
+    NS_LOG_INFO("\n");
+    
+    // Convert NodeContainer to vector for easier access
+    std::vector<Ptr<Node>> nodeVector;
+    for (uint32_t i = 0; i < nodes.GetN(); ++i) {
+        nodeVector.push_back(nodes.Get(i));
+    }
+    
+    // Print detailed blockchain states for selected nodes
+    PrintBlockchainStatesForNodes(nodeVector, selectedNodes);
+    
+    // Optional: Print all nodes if you want to see everything
+    // Uncomment the following lines if you want to see ALL nodes:
+    /*
+    NS_LOG_INFO("Printing blockchain states for ALL nodes:");
+    std::vector<uint32_t> allNodes;
+    for (uint32_t i = 0; i < numNodes; ++i) {
+        allNodes.push_back(i);
+    }
+    PrintBlockchainStatesForNodes(nodeVector, allNodes);
+    */
+    
+    // Additional analysis: Find consensus and forks
+    AnalyzeNetworkConsensus(nodeVector, numNodes);
+
     Simulator::Destroy();
     
     return 0;
 }
+
+
 
