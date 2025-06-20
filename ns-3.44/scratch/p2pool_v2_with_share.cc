@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <random>   // for random_device, mt19937
 // #include <algorithm> // for std::shuffle
+#include "ns3/random-variable-stream.h"  // Make sure this is included
 
 
 using namespace ns3;
@@ -706,7 +707,7 @@ struct Share {
         return share;
     }
 };
-
+// Add this enum for better block classification
 enum class BlockRelation {
     PARENT,              // This block is our parent (we should build on it)
     CHILD,               // This block is our child (they built on us)
@@ -715,53 +716,47 @@ enum class BlockRelation {
     REORG_NEEDED,        // This block represents a heavier chain
     ORPHAN,              // Block with unknown parent
     DUPLICATE,           // Block we already have
-    INVALID              // Invalid block (wrong parent relationship, etc.)
+    INVALID,             // Invalid block (wrong parent relationship, etc.)
+    REJECTED_UNCLE       // Uncle block rejected due to limit
 };
 
+// Fixed BlockchainState class with proper uncle limit implementation
 class BlockchainState {
 private:
     std::map<std::string, std::shared_ptr<Share>> m_blockchain;
     std::string m_currentHead;
     std::map<uint32_t, std::vector<std::string>> m_blocksByHeight;  // Height -> list of block hashes
     uint32_t m_currentHeight;
+    
+    // Uncle management - FIXED
+    uint32_t m_maxUnclesPerHeight;  // Maximum uncles allowed per height
+    std::map<uint32_t, std::vector<std::string>> m_unclesByHeight;  // Track accepted uncles by height
+    std::set<std::string> m_orphanBlocks;  // Track orphaned blocks (rejected uncles)
 
-
-
-    void printMainChain(uint32_t nodeId) const {
-        NS_LOG_INFO("--- MAIN CHAIN (Genesis to Head) ---");
-        
-        // Build main chain path
-        std::vector<std::string> mainChain;
-        std::string current = m_currentHead;
-        
-        while (current != "genesis" && !current.empty()) {
-            mainChain.push_back(current);
-            auto blockIt = m_blockchain.find(current);
-            if (blockIt == m_blockchain.end()) break;
-            current = blockIt->second->parentHash;
-        }
-        mainChain.push_back("genesis");
-        
-        std::reverse(mainChain.begin(), mainChain.end());
-        
-        // Print each block in the main chain
-        for (size_t i = 0; i < mainChain.size(); ++i) {
-            const auto& hash = mainChain[i];
-            auto block = m_blockchain.at(hash);
-            
-            std::string arrow = (i == mainChain.size() - 1) ? " [HEAD]" : " -> ";
-            
-            NS_LOG_INFO("  " << i << ": " << hash 
-                       << " (Height: " << block->blockNumber 
-                       << ", Miner: " << block->nodeId
-                       << ", Weight: " << block->chainWeight
-                       << ", Time: " << std::fixed << std::setprecision(2) << block->timestamp
-                       << ")" << arrow);
-        }
+    // Helper method to count current uncles at a height
+    uint32_t getUncleCountAtHeight(uint32_t height) const {
+        auto it = m_unclesByHeight.find(height);
+        return (it != m_unclesByHeight.end()) ? it->second.size() : 0;
     }
     
+    // Check if we can accept more uncles at this height
+    bool canAcceptUncleAtHeight(uint32_t height) const {
+        return getUncleCountAtHeight(height) < m_maxUnclesPerHeight;
+    }
+    
+    // Add uncle to tracking
+    void addUncleAtHeight(uint32_t height, const std::string& blockHash) {
+        m_unclesByHeight[height].push_back(blockHash);
+    }
+    
+    // Mark block as orphan
+    void markAsOrphan(const std::string& blockHash) {
+        m_orphanBlocks.insert(blockHash);
+    }
+
     void printSideChains(uint32_t nodeId) const {
         NS_LOG_INFO("--- SIDE CHAINS & UNCLE BLOCKS ---");
+        NS_LOG_INFO("Maximum uncles per height: " << m_maxUnclesPerHeight);
         
         std::map<uint32_t, std::vector<std::shared_ptr<Share>>> blocksByHeight;
         
@@ -778,11 +773,22 @@ private:
             const auto& blocks = heightPair.second;
             
             if (blocks.size() > 1) { // More than one block at this height
-                NS_LOG_INFO("  Height " << height << " has " << blocks.size() << " blocks:");
+                uint32_t uncleCount = getUncleCountAtHeight(height);
+                NS_LOG_INFO("  Height " << height << " has " << blocks.size() << " blocks (" 
+                           << uncleCount << "/" << m_maxUnclesPerHeight << " uncles):");
                 
                 for (const auto& block : blocks) {
                     bool isMainChain = isOnMainChain(block->blockHash);
-                    std::string status = isMainChain ? "[MAIN]" : "[SIDE]";
+                    bool isOrphan = m_orphanBlocks.find(block->blockHash) != m_orphanBlocks.end();
+                    
+                    std::string status;
+                    if (isMainChain) {
+                        status = "[MAIN]";
+                    } else if (isOrphan) {
+                        status = "[ORPHAN]";  // Changed from REJECTED to ORPHAN
+                    } else {
+                        status = "[UNCLE]";
+                    }
                     
                     NS_LOG_INFO("    " << status << " " << block->blockHash
                                << " (Miner: " << block->nodeId
@@ -798,6 +804,7 @@ private:
         
         std::vector<std::shared_ptr<Share>> orphans;
         
+        // Add blocks with unknown parents
         for (const auto& pair : m_blockchain) {
             if (pair.first != "genesis") {
                 const auto& block = pair.second;
@@ -809,22 +816,34 @@ private:
             }
         }
         
+        // Add blocks orphaned due to uncle limit
+        for (const auto& orphanHash : m_orphanBlocks) {
+            auto it = m_blockchain.find(orphanHash);
+            if (it != m_blockchain.end()) {
+                orphans.push_back(it->second);
+            }
+        }
+        
         if (orphans.empty()) {
             NS_LOG_INFO("  No orphan blocks found.");
         } else {
             for (const auto& orphan : orphans) {
+                bool isUncleLimit = m_orphanBlocks.find(orphan->blockHash) != m_orphanBlocks.end();
+                std::string reason = isUncleLimit ? "(Uncle limit exceeded)" : "(Unknown parent)";
+                
                 NS_LOG_INFO("  ORPHAN: " << orphan->blockHash
                            << " (Height: " << orphan->blockNumber
                            << ", Miner: " << orphan->nodeId
-                           << ", Parent: " << orphan->parentHash
-                           << ", Time: " << std::fixed << std::setprecision(2) << orphan->timestamp << ")");
+                           << ", Time: " << std::fixed << std::setprecision(2) << orphan->timestamp 
+                           << ") " << reason);
             }
         }
     }
 
-    
 public:
-    BlockchainState() : m_currentHead("genesis"), m_currentHeight(0) {
+    // FIXED: Constructor with proper default value
+    BlockchainState(uint32_t maxUnclesPerHeight = 5)  // Default to 5 instead of UINT32_MAX
+        : m_currentHead("genesis"), m_currentHeight(0), m_maxUnclesPerHeight(maxUnclesPerHeight) {
         // Initialize genesis block
         auto genesis = std::make_shared<Share>("genesis", "", 0, 0, 0.0);
         genesis->chainWeight = 0;
@@ -832,7 +851,18 @@ public:
         m_blocksByHeight[0].push_back("genesis");
     }
     
-    // Analyze relationship of incoming block
+    // Setter for max uncles (can be called from main)
+    void setMaxUnclesPerHeight(uint32_t maxUncles) {
+        m_maxUnclesPerHeight = maxUncles;
+        NS_LOG_INFO("Set maximum uncles per height to: " << maxUncles);
+    }
+    
+    // Getter for max uncles
+    uint32_t getMaxUnclesPerHeight() const {
+        return m_maxUnclesPerHeight;
+    }
+    
+    // FIXED: Analyze relationship with proper uncle limit logic
     BlockRelation analyzeBlock(const std::shared_ptr<Share>& newBlock) {
         // Check if we already have this block
         if (m_blockchain.find(newBlock->blockHash) != m_blockchain.end()) {
@@ -855,9 +885,14 @@ public:
             return BlockRelation::REORG_NEEDED;
         }
         
-        // Check relationships
+        // Check if it extends current head
         if (newBlock->parentHash == m_currentHead) {
             return BlockRelation::PARENT;  // Should be our new head
+        }
+        
+        // For side chains - check uncle limit FIRST
+        if (!canAcceptUncleAtHeight(newBlock->blockNumber)) {
+            return BlockRelation::REJECTED_UNCLE;  // Too many uncles already
         }
         
         // Check if it's building on our current chain
@@ -865,7 +900,7 @@ public:
             if (newBlock->blockNumber == m_currentHeight + 1) {
                 return BlockRelation::PARENT;
             } else {
-                return BlockRelation::UNCLE;  // Side chain
+                return BlockRelation::UNCLE;  // Side chain - can be uncle
             }
         }
         
@@ -877,17 +912,21 @@ public:
         return BlockRelation::UNCLE;
     }
     
-    // Add block to blockchain and handle reorganization
+    // FIXED: Add block with proper uncle limit handling
     bool addBlock(const std::shared_ptr<Share>& newBlock) {
         BlockRelation relation = analyzeBlock(newBlock);
         
         switch (relation) {
             case BlockRelation::DUPLICATE:
-                return false;  // Already have this block
+                NS_LOG_DEBUG("Duplicate block: " << newBlock->blockHash);
+                return false;
                 
             case BlockRelation::ORPHAN:
-                // Store orphan blocks, might become valid later
+                // Store orphan blocks
+                newBlock->calculateChainWeight(m_blockchain);
                 m_blockchain[newBlock->blockHash] = newBlock;
+                m_blocksByHeight[newBlock->blockNumber].push_back(newBlock->blockHash);
+                NS_LOG_INFO("Added orphan block: " << newBlock->blockHash);
                 return false;
                 
             case BlockRelation::PARENT:
@@ -897,6 +936,7 @@ public:
                 m_blocksByHeight[newBlock->blockNumber].push_back(newBlock->blockHash);
                 m_currentHead = newBlock->blockHash;
                 m_currentHeight = newBlock->blockNumber;
+                NS_LOG_INFO("New chain head: " << newBlock->blockHash << " at height " << m_currentHeight);
                 return true;
                 
             case BlockRelation::REORG_NEEDED:
@@ -904,18 +944,34 @@ public:
                 
             case BlockRelation::SIBLING:
             case BlockRelation::UNCLE:
-                // Add to side chain
+                // Add to side chain as uncle
                 newBlock->calculateChainWeight(m_blockchain);
                 m_blockchain[newBlock->blockHash] = newBlock;
                 m_blocksByHeight[newBlock->blockNumber].push_back(newBlock->blockHash);
-                return false;  // Not new head, but stored
+                addUncleAtHeight(newBlock->blockNumber, newBlock->blockHash);
+                NS_LOG_INFO("Added uncle block " << newBlock->blockHash 
+                           << " at height " << newBlock->blockNumber 
+                           << " (" << getUncleCountAtHeight(newBlock->blockNumber) 
+                           << "/" << m_maxUnclesPerHeight << ")");
+                return false;
+                
+            case BlockRelation::REJECTED_UNCLE:
+                // FIXED: Mark as orphan instead of rejected
+                newBlock->calculateChainWeight(m_blockchain);
+                m_blockchain[newBlock->blockHash] = newBlock;
+                m_blocksByHeight[newBlock->blockNumber].push_back(newBlock->blockHash);
+                markAsOrphan(newBlock->blockHash);
+                NS_LOG_INFO("Orphaned block due to uncle limit: " << newBlock->blockHash 
+                           << " at height " << newBlock->blockNumber 
+                           << " (uncle limit " << m_maxUnclesPerHeight << " exceeded)");
+                return false;
                 
             default:
                 return false;
         }
     }
     
-    // Perform blockchain reorganization
+    // Rest of the methods remain the same...
     bool performReorganization(const std::shared_ptr<Share>& newBlock) {
         // Add the new block first
         newBlock->calculateChainWeight(m_blockchain);
@@ -927,6 +983,8 @@ public:
         
         if (heaviestBlock != m_currentHead) {
             std::string oldHead = m_currentHead;
+            updateUncleTrackingForReorg(oldHead, heaviestBlock);
+            
             m_currentHead = heaviestBlock;
             m_currentHeight = m_blockchain[heaviestBlock]->blockNumber;
             
@@ -938,7 +996,30 @@ public:
         return false;
     }
     
-    // Find block with highest chain weight
+    void updateUncleTrackingForReorg(const std::string& oldHead, const std::string& newHead) {
+        // Clear current uncle tracking and rebuild
+        m_unclesByHeight.clear();
+        m_orphanBlocks.clear();
+        
+        // Rebuild uncle tracking based on new main chain
+        for (const auto& heightPair : m_blocksByHeight) {
+            uint32_t height = heightPair.first;
+            const auto& blocksAtHeight = heightPair.second;
+            
+            uint32_t uncleCount = 0;
+            for (const auto& blockHash : blocksAtHeight) {
+                if (!isOnMainChain(blockHash) && blockHash != "genesis") {
+                    if (uncleCount < m_maxUnclesPerHeight) {
+                        addUncleAtHeight(height, blockHash);
+                        uncleCount++;
+                    } else {
+                        markAsOrphan(blockHash);
+                    }
+                }
+            }
+        }
+    }
+    
     std::string findHeaviestChain() {
         std::string heaviest = m_currentHead;
         uint32_t maxWeight = m_blockchain[m_currentHead]->chainWeight;
@@ -953,8 +1034,7 @@ public:
         return heaviest;
     }
     
-    // Check if block is on main chain
-    bool isOnMainChain(const std::string& blockHash) const  {
+    bool isOnMainChain(const std::string& blockHash) const {
         std::string current = m_currentHead;
         while (current != "genesis" && !current.empty()) {
             if (current == blockHash) {
@@ -967,73 +1047,131 @@ public:
         return blockHash == "genesis";
     }
     
-    // Get current blockchain info
+    // Getters
     std::string getCurrentHead() const { return m_currentHead; }
     uint32_t getCurrentHeight() const { return m_currentHeight; }
     
-    // Get blocks at specific height (for uncle detection)
     std::vector<std::string> getBlocksAtHeight(uint32_t height) {
         auto it = m_blocksByHeight.find(height);
         return (it != m_blocksByHeight.end()) ? it->second : std::vector<std::string>();
     }
     
-    // Print blockchain state for debugging
-    void printState() const {
-        NS_LOG_INFO("=== Blockchain State ===");
-        NS_LOG_INFO("Current Head: " << m_currentHead);
-        NS_LOG_INFO("Current Height: " << m_currentHeight);
-        NS_LOG_INFO("Total Blocks: " << m_blockchain.size());
+    std::vector<std::string> getUnclesAtHeight(uint32_t height) const {
+        auto it = m_unclesByHeight.find(height);
+        return (it != m_unclesByHeight.end()) ? it->second : std::vector<std::string>();
+    }
+    
+    std::set<std::string> getOrphanBlocks() const {
+        return m_orphanBlocks;
+    }
+    
+    // COMPLETELY FIXED printMainChain method
+    void printMainChain(uint32_t nodeId) const {
+        NS_LOG_INFO("--- MAIN CHAIN (Genesis to Head) ---");
         
-        // Print chain from head to genesis
-        std::string current = m_currentHead;
         std::vector<std::string> mainChain;
+        std::string current = m_currentHead;
         
-        while (current != "genesis" && !current.empty()) {
-            mainChain.push_back(current);
-            auto blockIt = m_blockchain.find(current);
-            if (blockIt == m_blockchain.end()) break;
-            current = blockIt->second->parentHash;
+        // Safety check: ensure current head exists
+        auto headIt = m_blockchain.find(current);
+        if (headIt == m_blockchain.end()) {
+            NS_LOG_ERROR("ERROR: Current head '" << current << "' not found in blockchain!");
+            return;
         }
-        mainChain.push_back("genesis");
         
+        // Traverse backwards from head to genesis with safety checks
+        std::set<std::string> visited; // Prevent infinite loops
+        while (current != "genesis" && !current.empty()) {
+            // Check for cycles
+            if (visited.find(current) != visited.end()) {
+                NS_LOG_ERROR("ERROR: Cycle detected in blockchain at block: " << current);
+                break;
+            }
+            visited.insert(current);
+            
+            mainChain.push_back(current);
+            
+            // Safe access to blockchain map
+            auto blockIt = m_blockchain.find(current);
+            if (blockIt == m_blockchain.end()) {
+                NS_LOG_ERROR("ERROR: Block '" << current << "' not found in blockchain during traversal!");
+                break;
+            }
+            
+            current = blockIt->second->parentHash;
+            
+            // Additional safety: check if parent exists (except for genesis)
+            if (current != "genesis" && current != "" && m_blockchain.find(current) == m_blockchain.end()) {
+                NS_LOG_ERROR("ERROR: Parent block '" << current << "' not found for block '" 
+                            << mainChain.back() << "'!");
+                break;
+            }
+        }
+        
+        // Add genesis if we reached it
+        if (current == "genesis") {
+            mainChain.push_back("genesis");
+        }
+        
+        // Reverse to show genesis -> head
         std::reverse(mainChain.begin(), mainChain.end());
         
-        for (const auto& hash : mainChain) {
-            auto block = m_blockchain.at(hash);
-            NS_LOG_INFO("  " << hash << " (height: " << block->blockNumber 
-                       << ", weight: " << block->chainWeight << ")");
+        // Print the chain with safe access
+        for (size_t i = 0; i < mainChain.size(); ++i) {
+            const auto& hash = mainChain[i];
+            
+            // Safe access using find instead of at()
+            auto blockIt = m_blockchain.find(hash);
+            if (blockIt == m_blockchain.end()) {
+                NS_LOG_ERROR("ERROR: Block '" << hash << "' missing during print!");
+                continue;
+            }
+            
+            const auto& block = blockIt->second;
+            std::string arrow = (i == mainChain.size() - 1) ? " [HEAD]" : " -> ";
+            
+            NS_LOG_INFO("  " << i << ": " << hash 
+                       << " (Height: " << block->blockNumber 
+                       << ", Miner: " << block->nodeId
+                       << ", Weight: " << block->chainWeight
+                       << ", Time: " << std::fixed << std::setprecision(2) << block->timestamp
+                       << ")" << arrow);
+        }
+        
+        if (mainChain.empty()) {
+            NS_LOG_ERROR("ERROR: Main chain is empty!");
         }
     }
 
-
-        // Enhanced method to print complete blockchain state with more detail
     void printCompleteState(uint32_t nodeId) const {
         NS_LOG_INFO("=== COMPLETE BLOCKCHAIN STATE FOR NODE " << nodeId << " ===");
         NS_LOG_INFO("Current Head: " << m_currentHead);
         NS_LOG_INFO("Current Height: " << m_currentHeight);
         NS_LOG_INFO("Total Blocks: " << m_blockchain.size());
+        NS_LOG_INFO("Max Uncles Per Height: " << m_maxUnclesPerHeight);
         
-        // Print main chain from genesis to head
         printMainChain(nodeId);
-        
-        // Print uncle/side blocks
         printSideChains(nodeId);
-        
-        // Print orphan blocks
         printOrphanBlocks(nodeId);
         
         NS_LOG_INFO("=== END BLOCKCHAIN STATE FOR NODE " << nodeId << " ===\n");
     }
 
-    // Method to get blockchain statistics
     std::map<std::string, uint32_t> getBlockchainStats() const {
         std::map<std::string, uint32_t> stats;
         
         stats["total_blocks"] = m_blockchain.size();
-        stats["main_chain_length"] = m_currentHeight + 1; // +1 for genesis
+        stats["main_chain_length"] = m_currentHeight + 1;
         stats["side_blocks"] = m_blockchain.size() - (m_currentHeight + 1);
+        stats["max_uncles_per_height"] = m_maxUnclesPerHeight;
+        stats["orphan_blocks"] = m_orphanBlocks.size();
         
-        // Count blocks by miner
+        uint32_t totalUncles = 0;
+        for (const auto& pair : m_unclesByHeight) {
+            totalUncles += pair.second.size();
+        }
+        stats["total_uncles"] = totalUncles;
+        
         std::map<uint32_t, uint32_t> minerCounts;
         for (const auto& pair : m_blockchain) {
             if (pair.first != "genesis") {
@@ -1045,8 +1183,7 @@ public:
         
         return stats;
     }
-    
-    // Get all blocks as a vector for analysis
+
     std::vector<std::shared_ptr<Share>> getAllBlocks() const {
         std::vector<std::shared_ptr<Share>> allBlocks;
         for (const auto& pair : m_blockchain) {
@@ -1058,7 +1195,7 @@ public:
     }
 };
 
-// Updated MinerApp class to work with the integrated gossip system
+// Updated MinerApp class with normal distribution for mining intervals
 class MinerApp : public Application {
     private:
         EventId m_miningEvent;
@@ -1070,23 +1207,25 @@ class MinerApp : public Application {
         // Blockchain state management
         std::unique_ptr<BlockchainState> m_blockchain;
         
-        // Per-node random number generator for mining intervals
-        Ptr<UniformRandomVariable> m_miningIntervalRNG;
+        // Per-node normal distribution random number generator for mining intervals
+        Ptr<NormalRandomVariable> m_miningIntervalRNG;
         
     protected:
-        // Fixed mining interval parameters
-        static double s_minMiningInterval;
-        static double s_maxMiningInterval;
+        // Normal distribution parameters for mining intervals
+        static double s_meanMiningInterval;     // Mean mining time (seconds)
+        static double s_stdMiningInterval;      // Standard deviation (seconds)
+        static double s_minMiningInterval;      // Minimum allowed interval (prevent negative values)
+        static double s_maxMiningInterval;      // Maximum allowed interval (prevent extremely long waits)
         
     public:
         MinerApp() {
             // Initialize blockchain state
             m_blockchain = std::make_unique<BlockchainState>();
             
-            // Initialize per-node random number generator
-            m_miningIntervalRNG = CreateObject<UniformRandomVariable>();
-            m_miningIntervalRNG->SetAttribute("Min", DoubleValue(s_minMiningInterval));
-            m_miningIntervalRNG->SetAttribute("Max", DoubleValue(s_maxMiningInterval));
+            // Initialize per-node normal distribution random number generator
+            m_miningIntervalRNG = CreateObject<NormalRandomVariable>();
+            m_miningIntervalRNG->SetAttribute("Mean", DoubleValue(s_meanMiningInterval));
+            m_miningIntervalRNG->SetAttribute("Variance", DoubleValue(s_stdMiningInterval * s_stdMiningInterval));
         }
         
         static uint32_t totalBlocksMined;
@@ -1096,8 +1235,8 @@ class MinerApp : public Application {
             m_running = true;
             NS_LOG_INFO("MinerApp started on node " << GetNode()->GetId());
             
-            // Start mining immediately with a random delay
-            double initialDelay = m_miningIntervalRNG->GetValue();
+            // Start mining immediately with a random delay from normal distribution
+            double initialDelay = GetNextMiningInterval();
             m_miningEvent = Simulator::Schedule(Seconds(initialDelay), &MinerApp::MineBlock, this);
             
             NS_LOG_INFO("Node " << GetNode()->GetId() << " will start mining in " << initialDelay << " seconds");
@@ -1114,7 +1253,7 @@ class MinerApp : public Application {
             // m_blockchain->printState();
         }
 
-            // Method to get blockchain state for analysis
+        // Method to get blockchain state for analysis
         const BlockchainState* GetBlockchainState() const {
             return m_blockchain.get();
         }
@@ -1146,6 +1285,14 @@ class MinerApp : public Application {
         
         uint32_t GetBlocksMined() const {
             return m_blockCounter;
+        }
+        
+        // Static methods to configure mining distribution parameters
+        static void SetMiningParameters(double mean, double stdDev, double minInterval = 5.0, double maxInterval = 35.0) {
+            s_meanMiningInterval = mean;
+            s_stdMiningInterval = stdDev;
+            s_minMiningInterval = minInterval;
+            s_maxMiningInterval = maxInterval;
         }
         
         // Called when a node receives a block from another node via gossip
@@ -1209,6 +1356,16 @@ class MinerApp : public Application {
         }
         
     private:
+        // Generate next mining interval using normal distribution with bounds
+        double GetNextMiningInterval() {
+            double interval;
+            do {
+                interval = m_miningIntervalRNG->GetValue();
+            } while (interval < s_minMiningInterval || interval > s_maxMiningInterval);
+            
+            return interval;
+        }
+        
         void MineBlock() {
             if (!m_running || Simulator::Now().GetSeconds() >= m_stopMiningTime) {
                 return;
@@ -1251,7 +1408,7 @@ class MinerApp : public Application {
         void ScheduleNextMining() {
             if (!m_running) return;
             
-            double nextMiningInterval = m_miningIntervalRNG->GetValue();
+            double nextMiningInterval = GetNextMiningInterval();
             double currentTime = Simulator::Now().GetSeconds();
             
             if (currentTime + nextMiningInterval < m_stopMiningTime) {
@@ -1266,11 +1423,12 @@ class MinerApp : public Application {
                 Simulator::Cancel(m_miningEvent);
             }
             
-            // Schedule new mining with short delay
-            double restartDelay = 0.1; // 100ms delay before restarting
+            // Schedule new mining with normal distribution delay
+            double restartDelay = GetNextMiningInterval() * 0.1; // 10% of normal interval for restart
+            restartDelay = std::max(0.1, restartDelay); // Minimum 100ms delay
             m_miningEvent = Simulator::Schedule(Seconds(restartDelay), &MinerApp::MineBlock, this);
             
-            NS_LOG_INFO("Node " << GetNode()->GetId() << " restarting mining after reorganization");
+            NS_LOG_INFO("Node " << GetNode()->GetId() << " restarting mining after reorganization in " << restartDelay << " seconds");
         }
         
         std::string generateBlockHash(uint32_t height, uint32_t nodeId, double timestamp) {
@@ -1294,12 +1452,16 @@ class MinerApp : public Application {
         }
     };
     
-    // Initialize static members
+    // Initialize static members with reasonable defaults
     uint32_t MinerApp::totalBlocksMined = 0;
     std::map<uint32_t, uint32_t> MinerApp::perNodeMinedBlocks;
-    double MinerApp::s_minMiningInterval = 0.0;
-    double MinerApp::s_maxMiningInterval = 30.0;
-
+    
+    // Normal distribution parameters (can be configured via SetMiningParameters)
+    // Each node mines on average every 15 seconds
+    double MinerApp::s_meanMiningInterval = 15.0;    // 15 seconds mean
+    double MinerApp::s_stdMiningInterval = 4.0;      // 4 seconds standard deviation
+    double MinerApp::s_minMiningInterval = 5.0;      // 5 seconds minimum
+    double MinerApp::s_maxMiningInterval = 35.0;     // 35 seconds maximum
 
 void TcpGossipApp::ProcessReceivedMessage(const std::string& message) {
     // Since you're only handling blockchain messages, check if this is one
@@ -1657,81 +1819,177 @@ class NetworkMonitor {
             std::cout << "=================================================" << std::endl;
         }
     };
-
-
-    void PrintBlockchainStatesForNodes(const std::vector<Ptr<Node>>& nodes, 
-                                    const std::vector<uint32_t>& nodeIds) {
-        NS_LOG_INFO("\n");
-        NS_LOG_INFO("################################################################################");
-        NS_LOG_INFO("                    FINAL BLOCKCHAIN STATES COMPARISON");
-        NS_LOG_INFO("################################################################################");
-        
-        // Print individual blockchain states
-        for (uint32_t nodeId : nodeIds) {
-            if (nodeId < nodes.size()) {
-                Ptr<Node> node = nodes[nodeId];
-                
-                // Get the MinerApp from the node
-                Ptr<Application> app = node->GetApplication(1); // Assuming MinerApp is first
-                Ptr<MinerApp> minerApp = DynamicCast<MinerApp>(app);
-                
-                if (minerApp) {
-                    const BlockchainState* blockchain = minerApp->GetBlockchainState();
-                    blockchain->printCompleteState(nodeId);
+    
+void AnalyzeNetworkConsensus(const std::vector<Ptr<Node>>& nodes, uint32_t numNodes) {
+    NS_LOG_INFO("################################################################################");
+    NS_LOG_INFO("                         NETWORK CONSENSUS ANALYSIS");
+    NS_LOG_INFO("################################################################################");
+    
+    std::map<std::string, std::vector<uint32_t>> consensusGroups;
+    std::map<uint32_t, std::vector<uint32_t>> heightGroups;
+    
+    // Group nodes by their chain head and height
+    for (uint32_t i = 0; i < numNodes; ++i) {
+        Ptr<Node> node = nodes[i];
+        if (node->GetNApplications() > 1) {  // Make sure we have at least 2 applications
+            Ptr<Application> app = node->GetApplication(1);  // Use index 1 for MinerApp
+            Ptr<MinerApp> minerApp = DynamicCast<MinerApp>(app);
+            
+            if (minerApp) {
+                const BlockchainState* blockchain = minerApp->GetBlockchainState();
+                if (blockchain) {
+                    std::string head = blockchain->getCurrentHead();
+                    uint32_t height = blockchain->getCurrentHeight();
                     
-                    // Print node statistics
-                    auto stats = minerApp->getNodeStats();
-                    NS_LOG_INFO("Node " << nodeId << " Statistics:");
-                    NS_LOG_INFO("  Blocks Mined: " << stats["blocks_mined"]);
-                    NS_LOG_INFO("  Total Blocks Seen: " << stats["total_blocks_seen"]);
-                    NS_LOG_INFO("  Main Chain Length: " << stats["main_chain_length"]);
-                    NS_LOG_INFO("  Side Blocks Seen: " << stats["side_blocks_seen"]);
-                    NS_LOG_INFO("");
+                    consensusGroups[head].push_back(i);
+                    heightGroups[height].push_back(i);
                 }
             }
         }
+    }
+    
+    // Analyze consensus
+    NS_LOG_INFO("\nConsensus Analysis:");
+    NS_LOG_INFO("Number of different chain heads: " << consensusGroups.size());
+    
+    if (consensusGroups.size() == 0) {
+        NS_LOG_INFO("⚠ ERROR: No valid blockchain states found!");
+        return;
+    }
+    
+    if (consensusGroups.size() == 1) {
+        NS_LOG_INFO("✓ PERFECT CONSENSUS: All nodes agree on the same chain head!");
+    } else {
+        NS_LOG_INFO("⚠ FORK DETECTED: Network has split into " << consensusGroups.size() << " groups:");
         
-        // Print comparison summary
-        NS_LOG_INFO("################################################################################");
-        NS_LOG_INFO("                         BLOCKCHAIN COMPARISON SUMMARY");
-        NS_LOG_INFO("################################################################################");
-        
-        std::map<std::string, uint32_t> headCounts;
-        std::map<uint32_t, uint32_t> chainLengths;
-        
-        for (uint32_t nodeId : nodeIds) {
-            if (nodeId < nodes.size()) {
-                Ptr<Node> node = nodes[nodeId];
+        for (const auto& group : consensusGroups) {
+            double percentage = (100.0 * group.second.size()) / numNodes;
+            NS_LOG_INFO("  Chain head " << group.first << ": " 
+                    << group.second.size() << " nodes (" 
+                    << std::fixed << std::setprecision(1) << percentage << "%)");
+            
+            // Show first few nodes in each group
+            NS_LOG_INFO("    Nodes: ");
+            for (size_t i = 0; i < std::min(size_t(10), group.second.size()); ++i) {
+                NS_LOG_INFO("      " << group.second[i]);
+            }
+            if (group.second.size() > 10) {
+                NS_LOG_INFO("      ... and " << (group.second.size() - 10) << " more");
+            }
+        }
+    }
+    
+    // Analyze chain heights
+    NS_LOG_INFO("\nChain Height Analysis:");
+    NS_LOG_INFO("Number of different chain heights: " << heightGroups.size());
+    
+    for (const auto& group : heightGroups) {
+        double percentage = (100.0 * group.second.size()) / numNodes;
+        NS_LOG_INFO("  Height " << group.first << ": " 
+                << group.second.size() << " nodes (" 
+                << std::fixed << std::setprecision(1) << percentage << "%)");
+    }
+    
+    // Find the longest chain
+    if (!heightGroups.empty()) {
+        auto longestChain = std::max_element(heightGroups.begin(), heightGroups.end());
+        double percentage = (100.0 * longestChain->second.size()) / numNodes;
+        NS_LOG_INFO("\nLongest chain has height: " << longestChain->first);
+        NS_LOG_INFO("Nodes on longest chain: " << longestChain->second.size() 
+                << " (" << std::fixed << std::setprecision(1) << percentage << "%)");
+    }
+    
+    NS_LOG_INFO("################################################################################");
+}
+// FIXED: Print function with proper application index
+void PrintBlockchainStatesForNodes(const std::vector<Ptr<Node>>& nodes, 
+                                const std::vector<uint32_t>& nodeIds) {
+    NS_LOG_INFO("\n");
+    NS_LOG_INFO("################################################################################");
+    NS_LOG_INFO("                    FINAL BLOCKCHAIN STATES COMPARISON");
+    NS_LOG_INFO("################################################################################");
+    
+    // Print individual blockchain states
+    for (uint32_t nodeId : nodeIds) {
+        if (nodeId < nodes.size()) {
+            Ptr<Node> node = nodes[nodeId];
+            
+            if (node->GetNApplications() > 1) {  // Make sure we have at least 2 applications
+                // Get the MinerApp from the node - Use index 1 for MinerApp
                 Ptr<Application> app = node->GetApplication(1);
                 Ptr<MinerApp> minerApp = DynamicCast<MinerApp>(app);
                 
                 if (minerApp) {
                     const BlockchainState* blockchain = minerApp->GetBlockchainState();
-                    std::string head = blockchain->getCurrentHead();
-                    uint32_t height = blockchain->getCurrentHeight();
-                    
-                    headCounts[head]++;
-                    chainLengths[height]++;
-                    
-                    NS_LOG_INFO("Node " << nodeId << " - Head: " << head << ", Height: " << height);
+                    if (blockchain) {
+                        blockchain->printCompleteState(nodeId);
+                        
+                        // Print node statistics with fixed formatting
+                        auto stats = minerApp->getNodeStats();
+                        NS_LOG_INFO("Node " << nodeId << " Statistics:");
+                        NS_LOG_INFO("  Blocks Mined: " << stats["blocks_mined"]);
+                        NS_LOG_INFO("  Total Blocks Seen: " << stats["total_blocks_seen"]);
+                        NS_LOG_INFO("  Main Chain Length: " << stats["main_chain_length"]);
+                        NS_LOG_INFO("  Side Blocks Seen: " << stats["side_blocks_seen"]);
+                        
+                        // Also print blockchain-specific stats
+                        auto blockchainStats = blockchain->getBlockchainStats();
+                        NS_LOG_INFO("  Total Blocks in Blockchain: " << blockchainStats["total_blocks"]);
+                        NS_LOG_INFO("  Side Blocks: " << blockchainStats["side_blocks"]);
+                        NS_LOG_INFO("  Orphan Blocks: " << blockchainStats["orphan_blocks"]);
+                        NS_LOG_INFO("  Total Uncles: " << blockchainStats["total_uncles"]);
+                        NS_LOG_INFO("  Unique Miners: " << blockchainStats["unique_miners"]);
+                        NS_LOG_INFO("");
+                    }
                 }
             }
         }
-        
-        NS_LOG_INFO("\nConsensus Analysis:");
-        NS_LOG_INFO("Different chain heads: " << headCounts.size());
-        for (const auto& pair : headCounts) {
-            NS_LOG_INFO("  Head " << pair.first << ": " << pair.second << " nodes");
-        }
-        
-        NS_LOG_INFO("\nChain length distribution:");
-        for (const auto& pair : chainLengths) {
-            NS_LOG_INFO("  Height " << pair.first << ": " << pair.second << " nodes");
-        }
-        
-        NS_LOG_INFO("################################################################################\n");
     }
-
+    
+    // Print comparison summary
+    NS_LOG_INFO("################################################################################");
+    NS_LOG_INFO("                         BLOCKCHAIN COMPARISON SUMMARY");
+    NS_LOG_INFO("################################################################################");
+    
+    std::map<std::string, uint32_t> headCounts;
+    std::map<uint32_t, uint32_t> chainLengths;
+    
+    for (uint32_t nodeId : nodeIds) {
+        if (nodeId < nodes.size()) {
+            Ptr<Node> node = nodes[nodeId];
+            if (node->GetNApplications() > 1) {
+                Ptr<Application> app = node->GetApplication(1);  // Use index 1 for MinerApp
+                Ptr<MinerApp> minerApp = DynamicCast<MinerApp>(app);
+                
+                if (minerApp) {
+                    const BlockchainState* blockchain = minerApp->GetBlockchainState();
+                    if (blockchain) {
+                        std::string head = blockchain->getCurrentHead();
+                        uint32_t height = blockchain->getCurrentHeight();
+                        
+                        headCounts[head]++;
+                        chainLengths[height]++;
+                        
+                        NS_LOG_INFO("Node " << nodeId << " - Head: " << head << ", Height: " << height);
+                    }
+                }
+            }
+        }
+    }
+    
+    NS_LOG_INFO("\nConsensus Analysis:");
+    NS_LOG_INFO("Different chain heads: " << headCounts.size());
+    for (const auto& pair : headCounts) {
+        NS_LOG_INFO("  Head " << pair.first << ": " << pair.second << " nodes");
+    }
+    
+    NS_LOG_INFO("\nChain length distribution:");
+    for (const auto& pair : chainLengths) {
+        NS_LOG_INFO("  Height " << pair.first << ": " << pair.second << " nodes");
+    }
+    
+    NS_LOG_INFO("################################################################################\n");
+}
     // Function to select random nodes for analysis
     std::vector<uint32_t> SelectRandomNodes(uint32_t totalNodes, uint32_t numToSelect) {
         std::vector<uint32_t> allNodes;
@@ -1755,87 +2013,17 @@ class NetworkMonitor {
         return selected;
     }
 
-
-
-    
-    // Additional function to analyze network consensus
-    void AnalyzeNetworkConsensus(const std::vector<Ptr<Node>>& nodes, uint32_t numNodes) {
-        NS_LOG_INFO("################################################################################");
-        NS_LOG_INFO("                         NETWORK CONSENSUS ANALYSIS");
-        NS_LOG_INFO("################################################################################");
-        
-        std::map<std::string, std::vector<uint32_t>> consensusGroups;
-        std::map<uint32_t, std::vector<uint32_t>> heightGroups;
-        
-        // Group nodes by their chain head and height
-        for (uint32_t i = 0; i < numNodes; ++i) {
-            Ptr<Node> node = nodes[i];
-            Ptr<Application> app = node->GetApplication(0);
-            Ptr<MinerApp> minerApp = DynamicCast<MinerApp>(app);
-            
-            if (minerApp) {
-                const BlockchainState* blockchain = minerApp->GetBlockchainState();
-                std::string head = blockchain->getCurrentHead();
-                uint32_t height = blockchain->getCurrentHeight();
-                
-                consensusGroups[head].push_back(i);
-                heightGroups[height].push_back(i);
-            }
-        }
-        
-        // Analyze consensus
-        NS_LOG_INFO("Consensus Analysis:");
-        NS_LOG_INFO("Number of different chain heads: " << consensusGroups.size());
-        
-        if (consensusGroups.size() == 1) {
-            NS_LOG_INFO("✓ PERFECT CONSENSUS: All nodes agree on the same chain head!");
-        } else {
-            NS_LOG_INFO("⚠ FORK DETECTED: Network has split into " << consensusGroups.size() << " groups:");
-            
-            for (const auto& group : consensusGroups) {
-                NS_LOG_INFO("  Chain head " << group.first << ": " 
-                        << group.second.size() << " nodes (" 
-                        << (100.0 * group.second.size() / numNodes) << "%)");
-                
-                // Show first few nodes in each group
-                NS_LOG_INFO("    Nodes: ");
-                for (size_t i = 0; i < std::min(size_t(10), group.second.size()); ++i) {
-                    NS_LOG_INFO("      " << group.second[i]);
-                }
-                if (group.second.size() > 10) {
-                    NS_LOG_INFO("      ... and " << (group.second.size() - 10) << " more");
-                }
-            }
-        }
-        
-        // Analyze chain heights
-        NS_LOG_INFO("\nChain Height Analysis:");
-        NS_LOG_INFO("Number of different chain heights: " << heightGroups.size());
-        
-        for (const auto& group : heightGroups) {
-            NS_LOG_INFO("  Height " << group.first << ": " 
-                    << group.second.size() << " nodes (" 
-                    << (100.0 * group.second.size() / numNodes) << "%)");
-        }
-        
-        // Find the longest chain
-        auto longestChain = std::max_element(heightGroups.begin(), heightGroups.end());
-        NS_LOG_INFO("\nLongest chain has height: " << longestChain->first);
-        NS_LOG_INFO("Nodes on longest chain: " << longestChain->second.size() 
-                << " (" << (100.0 * longestChain->second.size() / numNodes) << "%)");
-        
-        NS_LOG_INFO("################################################################################");
-    }
-
 int main(int argc, char* argv[]) {
    
     // Seed the random number generator with current time
     srand(time(nullptr));
     CommandLine cmd;
-    uint32_t numNodes = 101;
+    uint32_t numNodes = 15;
     uint32_t numPeers = 8;  // Changed to 8 connections per node
     double rewireProbability = 0.5;
-    double simulationTime = 500.0;
+    double simulationTime = 101.0;
+
+    BlockchainState blockchain(5);  // Max 5 uncles per height
 
     // Force decimal point display to avoid locale issues
     std::cout.setf(std::ios_base::fixed, std::ios_base::floatfield);
