@@ -33,7 +33,7 @@
 #include <sstream>
 #include <iomanip>
 #include "ns3/node-container.h"
-
+#include <chrono>
 
 extern ns3::NodeContainer nodes;
 ns3::NodeContainer nodes;
@@ -319,11 +319,13 @@ class TcpGossipApp : public Application {
         EventId m_connectionCheckEvent;
         bool m_connectionsEstablished;
         
-        // For batched message forwarding
+        // For batched message forwarding with latency control
         EventId m_forwardEvent;
-        std::vector<std::string> m_pendingMessages;
-        static const uint32_t MAX_PENDING_MESSAGES = 20;
         static const Time FORWARD_INTERVAL;
+        
+        // For scheduled message sending with latency
+        std::queue<std::pair<std::string, std::vector<Ipv6Address>>> m_messageQueue;
+        std::map<std::string, EventId> m_scheduledMessages;
     
     public:
         TcpGossipApp(Ipv6Address myAddress) 
@@ -340,9 +342,6 @@ class TcpGossipApp : public Application {
             }
         }
 
-
-
-        
         void GetNeighbors(std::vector<Ipv6Address>& neighbors) const {
             neighbors = m_neighbors;
         }
@@ -400,6 +399,14 @@ class TcpGossipApp : public Application {
             if (m_forwardEvent.IsRunning()) {
                 Simulator::Cancel(m_forwardEvent);
             }
+            
+            // Cancel all scheduled message forwarding events
+            for (auto& scheduledMsg : m_scheduledMessages) {
+                if (scheduledMsg.second.IsRunning()) {
+                    Simulator::Cancel(scheduledMsg.second);
+                }
+            }
+            m_scheduledMessages.clear();
             
             m_connectionPool.CloseAllConnections();
             
@@ -516,10 +523,9 @@ class TcpGossipApp : public Application {
                 ProcessReceivedMessage(line);
             }
         }
+        
         void HandleMissingBlockRequest(const std::string& message);
-
         void HandleMissingBlockResponse(const std::string& message);
-
         void ProcessReceivedMessage(const std::string& message);
 
         bool IsBlockchainMessage(const std::string& message) {
@@ -582,9 +588,8 @@ class TcpGossipApp : public Application {
             }
         }
 
+        // Modified ForwardMessage to use latency control
         void ForwardMessage(const std::string& msg) {
-            std::string msgWithDelimiter = msg + "\n";
-
             std::vector<Ipv6Address> activeNeighbors;
             for (const auto& neighbor : m_neighbors) {
                 if (m_connectionPool.IsActive(neighbor)) {
@@ -596,7 +601,37 @@ class TcpGossipApp : public Application {
                 return;
             }
             
-            for (const auto& neighbor : activeNeighbors) {
+            // Create a unique key for this message to avoid duplicate scheduling
+            std::string msgKey = msg + "_" + std::to_string(Simulator::Now().GetSeconds());
+            
+            // Cancel any existing scheduled event for this message
+            auto it = m_scheduledMessages.find(msgKey);
+            if (it != m_scheduledMessages.end() && it->second.IsRunning()) {
+                Simulator::Cancel(it->second);
+            }
+            
+            // Schedule the message to be sent after FORWARD_INTERVAL
+            EventId eventId = Simulator::Schedule(
+                FORWARD_INTERVAL,
+                &TcpGossipApp::DoForwardMessage,
+                this,
+                msg,
+                activeNeighbors
+            );
+            
+            m_scheduledMessages[msgKey] = eventId;
+        }
+        
+        // New method to actually send the message (called after delay)
+        void DoForwardMessage(const std::string& msg, const std::vector<Ipv6Address>& neighbors) {
+            std::string msgWithDelimiter = msg + "\n";
+            
+            for (const auto& neighbor : neighbors) {
+                // Double-check if neighbor is still active
+                if (!m_connectionPool.IsActive(neighbor)) {
+                    continue;
+                }
+                
                 Ptr<Socket> socket = m_connectionPool.GetSocket(neighbor);
                 
                 if (socket) {
@@ -642,13 +677,10 @@ class TcpGossipApp : public Application {
         }
     };
     
-    const Time TcpGossipApp::FORWARD_INTERVAL = MilliSeconds(100);
+    // You can now control the forwarding latency by changing this value
+    const Time TcpGossipApp::FORWARD_INTERVAL = MilliSeconds(0);
 
 
-
-
-
-// Enhanced Share struct with DAG support
 struct Share {
     std::string blockHash;
     std::string parentHash;
@@ -2003,7 +2035,7 @@ public:
                 if (!missingBlocks.empty() && m_gossipApp) {
                     // Add small delay to missing block requests to allow for natural race conditions
                     double requestDelay = m_networkDelayRNG->GetValue() * 0.5; // 0 to 50% of max network delay
-                    Simulator::Schedule(Seconds(requestDelay), 
+                    Simulator::Schedule(Seconds(1), 
                         [this, missingBlocks]() {
                             if (m_gossipApp) {
                                 m_gossipApp->RequestMissingBlocks(missingBlocks);
@@ -2565,14 +2597,14 @@ std::map<uint32_t, uint32_t> MinerApp::perNodeReorgs;
 std::map<uint32_t, uint32_t> MinerApp::perNodeOrphansReceived;
 
 // Normal distribution parameters for realistic mining intervals
-double MinerApp::s_meanMiningInterval = 15.0;    // 15 seconds mean
+double MinerApp::s_meanMiningInterval = 27.0;    // 15 seconds mean
 double MinerApp::s_stdMiningInterval = 4.0;      // 4 seconds standard deviation  
 double MinerApp::s_minMiningInterval = 5.0;      // 5 seconds minimum
 double MinerApp::s_maxMiningInterval = 35.0;     // 35 seconds maximum
 
 // Network simulation parameters for realistic fork creation
-double MinerApp::s_maxNetworkDelay = 2.0;        // Up to 2 seconds network delay
-double MinerApp::s_miningVariation = 1.0;        // ±1 second mining variation
+double MinerApp::s_maxNetworkDelay = 0.0;        // Up to 2 seconds network delay
+double MinerApp::s_miningVariation = 0.0;        // ±1 second mining variation
 
 void TcpGossipApp::HandleMissingBlockRequest(const std::string& message) {
             uint32_t nodeId = GetNode()->GetId();
@@ -3354,48 +3386,43 @@ std::vector<uint32_t> SelectRandomNodesAdvanced(uint32_t totalNodes, uint32_t nu
     std::sort(selected.begin(), selected.end());
     return selected;
 }
-    // Function to select random nodes for analysis
-    // std::vector<uint32_t> SelectRandomNodes(uint32_t totalNodes, uint32_t numToSelect) {
-    //     std::vector<uint32_t> allNodes;
-    //     for (uint32_t i = 0; i < totalNodes; ++i) {
-    //         allNodes.push_back(i);
-    //     }
-        
-    //     // Shuffle and select
-    //     std::random_device rd;
-    //     std::mt19937 gen(rd());
-    //     std::shuffle(allNodes.begin(), allNodes.end(), gen);
-        
-    //     std::vector<uint32_t> selected;
-    //     for (uint32_t i = 0; i < std::min(numToSelect, totalNodes); ++i) {
-    //         selected.push_back(allNodes[i]);
-    //     }
-        
-    //     // Sort for easier reading
-    //     std::sort(selected.begin(), selected.end());
-        
-    //     return selected;
-    // }
+// Option 1: Clean directory at simulation start
+void CleanOutputDirectory() {
+    NS_LOG_INFO("Cleaning output directory: " << outputDir);
+    
+    // Remove existing directory and recreate
+    std::string rmCmd = "rm -rf " + outputDir;
+    std::string mkdirCmd = "mkdir -p " + outputDir;
+    
+    system(rmCmd.c_str());
+    system(mkdirCmd.c_str());
+    
+    NS_LOG_INFO("Output directory cleaned and recreated");
+}
 
+// Option 2: Clean with timestamp-based directory
+void InitializeOutputDirectory() {
+    // Create timestamped directory
+    auto now = std::chrono::system_clock::now();
+    auto time_t = std::chrono::system_clock::to_time_t(now);
+    auto tm = *std::localtime(&time_t);
+    
+    std::stringstream timestamp;
+    timestamp << std::put_time(&tm, "%Y%m%d_%H%M%S");
+    
+    outputDir = "dag_results_" + timestamp.str() + "/";
+    
+    std::string mkdirCmd = "mkdir -p " + outputDir;
+    system(mkdirCmd.c_str());
+    
+    NS_LOG_INFO("Created timestamped output directory: " << outputDir);
+}
 
-    // void exportDAGVisualization(uint32_t nodeId) {
-    //     std::string filename = "dag_node_" + std::to_string(nodeId) + ".dot";
-    //     blockchainState.exportToDOT(filename, nodeId);
-        
-    //     // Also export simplified version
-    //     std::string simplifiedFilename = "dag_simple_node_" + std::to_string(nodeId) + ".dot";
-    //     blockchainState.exportSimplifiedDOT(simplifiedFilename, nodeId, 15);
-        
-    //     // Export network stats
-    //     std::string statsFilename = "dag_stats_node_" + std::to_string(nodeId) + ".dot";
-    //     blockchainState.exportNetworkStatsDOT(statsFilename, nodeId);
-    // }
-
-
+// Modified ExportDAGSnapshots with cleanup check
 void ExportDAGSnapshots(double exportTime) {
     NS_LOG_INFO("Exporting DAG snapshots at time " << exportTime);
     
-    // Create output directory if it doesn't exist
+    // Only create directory if it doesn't exist (don't clean here)
     std::string mkdirCmd = "mkdir -p " + outputDir;
     system(mkdirCmd.c_str());
     
@@ -3417,12 +3444,51 @@ void ExportDAGSnapshots(double exportTime) {
     }
 }
 
-// Function to schedule periodic DAG exports
+// Option 3: Clean specific file patterns
+void CleanOldDAGFiles() {
+    NS_LOG_INFO("Cleaning old DAG files from: " << outputDir);
+    
+    // Remove old DAG files
+    std::string cleanCmd = "rm -f " + outputDir + "blockchain_dag_*.dot";
+    system(cleanCmd.c_str());
+    
+    // Remove old analysis files
+    cleanCmd = "rm -f " + outputDir + "analysis_*.txt";
+    system(cleanCmd.c_str());
+    
+    // Remove old images
+    cleanCmd = "rm -rf " + outputDir + "images/";
+    system(cleanCmd.c_str());
+    
+    // Remove old final summary
+    cleanCmd = "rm -rf " + outputDir + "final_summary/";
+    system(cleanCmd.c_str());
+    
+    NS_LOG_INFO("Old DAG files cleaned");
+}
+
+// Enhanced initialization function
+void InitializeDAGExports(bool cleanExisting = true) {
+    if (cleanExisting) {
+        CleanOutputDirectory();  // Option 1: Complete cleanup
+        // OR
+        // CleanOldDAGFiles();   // Option 3: Selective cleanup
+    } else {
+        InitializeOutputDirectory();  // Option 2: Timestamped directory
+    }
+    
+    NS_LOG_INFO("DAG export system initialized");
+}
+
+// Function to schedule periodic DAG exports (unchanged)
 void ScheduleDAGExports(double startTime, double interval, double endTime) {
     for (double t = startTime; t <= endTime; t += interval) {
         Simulator::Schedule(Seconds(t), &ExportDAGSnapshots, t);
     }
 }
+
+
+// Your existing functions remain the same...
 void exportDetailedAnalysis(const BlockchainState& blockchain, 
                            const std::string& filename, 
                            uint32_t nodeId) {
@@ -3466,8 +3532,6 @@ void exportDetailedAnalysis(const BlockchainState& blockchain,
     NS_LOG_INFO("Analysis exported to: " << filename);
 }
 
-
-// Generate script to visualize all DOT files
 void generateVisualizationScript() {
     std::string scriptFilename = outputDir + "visualize_all.sh";
     std::ofstream scriptFile(scriptFilename);
@@ -3514,8 +3578,7 @@ void generateVisualizationScript() {
     NS_LOG_INFO("Visualization script created: " << scriptFilename);
 }
 
-
-// Function to export final DAG state
+// Enhanced final export with better cleanup
 void ExportFinalDAGState() {
     NS_LOG_INFO("Exporting final DAG state");
     
@@ -3547,36 +3610,41 @@ void ExportFinalDAGState() {
     
     // Generate visualization script
     generateVisualizationScript();
+    
+    NS_LOG_INFO("Final DAG export completed to: " << outputDir);
 }
-
-// Helper function to export detailed analysis
-
 
 
 int main(int argc, char* argv[]) {
-   
 
+    auto start_time = std::chrono::high_resolution_clock::now();
+    
     CommandLine cmd;
     bool enableDAGExport = true;
-    double dagExportInterval = 100.0; // Export every 10 seconds
+    double dagExportInterval = 30.0;
     std::string dagOutputDir = "dag_output/";
+    bool cleanDAGOutput = true;  // Add this option
     
     cmd.AddValue("enableDAGExport", "Enable DAG DOT file export", enableDAGExport);
     cmd.AddValue("dagExportInterval", "Interval between DAG exports (seconds)", dagExportInterval);
     cmd.AddValue("dagOutputDir", "Directory for DAG output files", dagOutputDir);
+    cmd.AddValue("cleanDAGOutput", "Clean output directory before simulation", cleanDAGOutput);
     cmd.Parse(argc, argv);
     
     // Set global output directory
     outputDir = dagOutputDir;
-
-
+    
+    // Initialize DAG export system (this will clean the directory)
+    if (enableDAGExport) {
+        InitializeDAGExports(cleanDAGOutput);
+    }
 
     // Seed the random number generator with current time
     srand(time(nullptr));
-    uint32_t numNodes = 50;
-    uint32_t numPeers = 8;  // Changed to 8 connections per node
+    uint32_t numNodes = 500;
+    uint32_t numPeers = 10;  // Changed to 8 connections per node
     double rewireProbability = 0.5;
-    double simulationTime = 101.0;
+    double simulationTime = 100.0;
 
     BlockchainState blockchain(2);  // Max 5 uncles per height
 
@@ -3604,8 +3672,9 @@ int main(int argc, char* argv[]) {
 
     // Create point-to-point helper
     PointToPointHelper pointToPoint;
-    pointToPoint.SetDeviceAttribute("DataRate", StringValue("100Mbps"));
-    pointToPoint.SetChannelAttribute("Delay", StringValue("10us"));
+    pointToPoint.SetDeviceAttribute("DataRate", StringValue("1Gbps"));
+    pointToPoint.SetChannelAttribute("Delay", TimeValue(MilliSeconds(300))); // 300ms delay
+
 
     // Create IPv6 address helper
     Ipv6AddressHelper ipv6;
@@ -3671,15 +3740,12 @@ int main(int argc, char* argv[]) {
     std::cout << "Running simulation for " << simulationTime << " seconds..." << std::endl;
     
     if (enableDAGExport) {
-        NS_LOG_INFO("DAG export enabled. Output directory: " << outputDir);
-        NS_LOG_INFO("Export interval: " << dagExportInterval << " seconds");
+        double startTime = 0.0;
+        double endTime = simulationTime;  // Your simulation end time
+        ScheduleDAGExports(startTime, dagExportInterval, endTime);
         
-        // Schedule periodic exports
-        double simulationTime = 100.0; // Replace with your actual simulation time
-        ScheduleDAGExports(dagExportInterval, dagExportInterval, simulationTime);
-        
-        // Schedule final export
-        Simulator::Schedule(Seconds(simulationTime), &ExportFinalDAGState);
+        // Schedule final export at the end
+        Simulator::Schedule(Seconds(endTime), &ExportFinalDAGState);
     }
 
     Simulator::Run(); 
@@ -3814,6 +3880,20 @@ CompareDAGBlockchainStates(nodeVector, allNodes);
         std::cout << "Or manually: dot -Tpng filename.dot -o filename.png\n";
         std::cout << "==========================\n\n";
     }
+
+
+
+    // End timing
+    auto end_time = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+    
+    // Print timing results
+    std::cout << "\n=== TIMING RESULTS ===" << std::endl;
+    std::cout << "Simulation time configured: " << simulationTime << " seconds" << std::endl;
+    std::cout << "Actual runtime: " << duration.count() << " milliseconds" << std::endl;
+    std::cout << "Actual runtime: " << duration.count() / 1000.0 << " seconds" << std::endl;
+    std::cout << "Simulation speed ratio: " << (simulationTime / (duration.count() / 1000.0)) << "x" << std::endl;
+    std::cout << "=====================" << std::endl;
 
 Simulator::Destroy();
     
