@@ -678,7 +678,7 @@ class TcpGossipApp : public Application {
     };
     
     // You can now control the forwarding latency by changing this value
-    const Time TcpGossipApp::FORWARD_INTERVAL = MilliSeconds(0);
+    const Time TcpGossipApp::FORWARD_INTERVAL = MilliSeconds(100);
 
 
 struct Share {
@@ -1884,7 +1884,7 @@ public:
         }
         
         // Start mining immediately with a random delay from normal distribution
-        double initialDelay = GetNextMiningInterval();
+        double initialDelay = 10;
         m_miningEvent = Simulator::Schedule(Seconds(initialDelay), &MinerApp::MineBlock, this);
         
         NS_LOG_INFO("Node " << nodeId << " will start DAG mining in " << initialDelay << " seconds");
@@ -2035,7 +2035,7 @@ public:
                 if (!missingBlocks.empty() && m_gossipApp) {
                     // Add small delay to missing block requests to allow for natural race conditions
                     double requestDelay = m_networkDelayRNG->GetValue() * 0.5; // 0 to 50% of max network delay
-                    Simulator::Schedule(Seconds(1), 
+                    Simulator::Schedule(Seconds(requestDelay), 
                         [this, missingBlocks]() {
                             if (m_gossipApp) {
                                 m_gossipApp->RequestMissingBlocks(missingBlocks);
@@ -2141,7 +2141,8 @@ private:
                 std::string serializedBlock = newBlock->serialize();
                 
                 // Add realistic network propagation delay
-                double propagationDelay = m_networkDelayRNG->GetValue();
+                // double propagationDelay = m_networkDelayRNG->GetValue();
+                double propagationDelay = 0.0; 
                 
                 Simulator::Schedule(Seconds(propagationDelay), 
                     [this, serializedBlock, nodeId, propagationDelay]() {
@@ -2597,14 +2598,19 @@ std::map<uint32_t, uint32_t> MinerApp::perNodeReorgs;
 std::map<uint32_t, uint32_t> MinerApp::perNodeOrphansReceived;
 
 // Normal distribution parameters for realistic mining intervals
-double MinerApp::s_meanMiningInterval = 27.0;    // 15 seconds mean
+double MinerApp::s_meanMiningInterval = 30.0;    // 15 seconds mean
 double MinerApp::s_stdMiningInterval = 4.0;      // 4 seconds standard deviation  
 double MinerApp::s_minMiningInterval = 5.0;      // 5 seconds minimum
 double MinerApp::s_maxMiningInterval = 35.0;     // 35 seconds maximum
 
-// Network simulation parameters for realistic fork creation
-double MinerApp::s_maxNetworkDelay = 0.0;        // Up to 2 seconds network delay
-double MinerApp::s_miningVariation = 0.0;        // ±1 second mining variation
+// double MinerApp::s_meanMiningInterval = 100.0;   // 100 seconds mean
+// double MinerApp::s_stdMiningInterval = 10.0;     // 10 seconds standard deviation (tunable)
+// double MinerApp::s_minMiningInterval = 60.0;     // 60 seconds minimum
+// double MinerApp::s_maxMiningInterval = 140.0;    // 140 seconds maximum
+
+// // Network simulation parameters for realistic fork creation
+double MinerApp::s_maxNetworkDelay = 2.0;        // Up to 2 seconds network delay
+double MinerApp::s_miningVariation = 1.0;        // ±1 second mining variation
 
 void TcpGossipApp::HandleMissingBlockRequest(const std::string& message) {
             uint32_t nodeId = GetNode()->GetId();
@@ -3641,10 +3647,10 @@ int main(int argc, char* argv[]) {
 
     // Seed the random number generator with current time
     srand(time(nullptr));
-    uint32_t numNodes = 500;
+    uint32_t numNodes = 50;
     uint32_t numPeers = 10;  // Changed to 8 connections per node
     double rewireProbability = 0.5;
-    double simulationTime = 100.0;
+    double simulationTime = 120.0;
 
     BlockchainState blockchain(2);  // Max 5 uncles per height
 
@@ -3673,7 +3679,7 @@ int main(int argc, char* argv[]) {
     // Create point-to-point helper
     PointToPointHelper pointToPoint;
     pointToPoint.SetDeviceAttribute("DataRate", StringValue("1Gbps"));
-    pointToPoint.SetChannelAttribute("Delay", TimeValue(MilliSeconds(300))); // 300ms delay
+    pointToPoint.SetChannelAttribute("Delay", TimeValue(MilliSeconds(10))); // 300ms delay
 
 
     // Create IPv6 address helper
@@ -3731,7 +3737,7 @@ int main(int argc, char* argv[]) {
     // Schedule progress reporting
     Simulator::Schedule(Seconds(1.0), &PrintSimulationProgress, 1.0);
 
-    // Configure when to stop the simulation
+    // Configure when to stop the simulationMinerApp started o
     // Simulator::Schedule(Seconds(10.0), &exportDAGVisualization, nodeId);
     
     Simulator::Stop(Seconds(simulationTime));
